@@ -115,6 +115,150 @@ test('stale edits merge only when changed canonical paths do not overlap', () =>
   assert.equal(d.adjudication.result, 'merged');
 });
 
+function multiParamStore() {
+  const dir = tmpDir();
+  const store = new Store(dir);
+  const body = `{"core":{"command":"ORBIT_RAISE","parameters":{"deltaV":12.5,"window":"2026-10-08T02:00:00Z","mode":"SAFE"}},"extensions":${EXT_RAW}}`;
+  const raw = env.extractRawValue(body, 'extensions');
+  const pkg = store.create(env.validateCreate(JSON.parse(body), raw).value);
+  return { dir, store, pkg, raw };
+}
+
+// Terminal A declares it knows the whole parameters object and resubmits it
+// with only deltaV changed; terminal B knows only window.
+const W0 = '2026-10-08T02:00:00Z';
+const W1 = '2026-10-09T03:00:00Z';
+const params0 = { deltaV: 12.5, window: W0, mode: 'SAFE' };
+
+function editA(over = {}) {
+  return edit({
+    requestId: 'term-A',
+    knownFields: ['core.parameters'],
+    set: { 'core.parameters': { deltaV: 14.0, window: W0, mode: 'SAFE' } },
+    ...over,
+  });
+}
+function editB(over = {}) {
+  return edit({
+    requestId: 'term-B',
+    knownFields: ['core.parameters.window'],
+    set: { 'core.parameters.window': W1 },
+    ...over,
+  });
+}
+
+test('parent-object resubmission records only the leaf it actually changed', () => {
+  const { store, pkg } = multiParamStore();
+  const a = store.submitEdit(pkg.id, editA());
+  assert.equal(a.adjudication.result, 'applied');
+  assert.deepEqual(a.adjudication.changedPaths, ['core.parameters.deltaV']);
+  assert.deepEqual(store.get(pkg.id).history.find((h) => h.revision === 2).changedPaths,
+    ['core.parameters.deltaV']);
+});
+
+test('stale leaf edits to different fields merge regardless of commit order', () => {
+  for (const order of [['A', 'B'], ['B', 'A']]) {
+    const { store, pkg } = multiParamStore();
+    const first = order[0] === 'A' ? editA() : editB();
+    const second = order[1] === 'A' ? editA() : editB();
+    const r1 = store.submitEdit(pkg.id, first);
+    const r2 = store.submitEdit(pkg.id, second);
+    assert.equal(r1.adjudication.result, 'applied', 'order ' + order);
+    assert.equal(r2.adjudication.result, 'merged', 'order ' + order);
+    assert.equal(r2.adjudication.revision, 3, 'order ' + order);
+    const p = store.get(pkg.id);
+    assert.equal(p.revision, 3);
+    assert.equal(p.core.parameters.deltaV, 14.0);
+    assert.equal(p.core.parameters.window, W1);
+    assert.equal(p.core.parameters.mode, 'SAFE'); // untouched sibling
+    assert.equal(p.core.command, 'ORBIT_RAISE');
+  }
+});
+
+test('two stale edits changing the same leaf with different values conflict', () => {
+  const { store, pkg } = multiParamStore();
+  store.submitEdit(pkg.id, editB()); // window -> W1, rev 2
+  const clash = store.submitEdit(pkg.id, edit({
+    requestId: 'same-leaf',
+    baseRevision: 1,
+    knownFields: ['core.parameters.window'],
+    set: { 'core.parameters.window': '2026-10-11T00:00:00Z' },
+  }));
+  assert.equal(clash.adjudication.result, 'rejected');
+  assert.equal(clash.adjudication.reason, 'conflicting-paths');
+  assert.deepEqual(clash.adjudication.changedPaths, ['core.parameters.window']);
+  assert.equal(store.get(pkg.id).revision, 2);
+  assert.equal(store.get(pkg.id).core.parameters.window, W1);
+});
+
+test('whole-object submission whose changed leaf really overlaps is not merged', () => {
+  const { store, pkg } = multiParamStore();
+  // Revision 2 really changes deltaV.
+  store.submitEdit(pkg.id, edit({
+    requestId: 'dv-first',
+    knownFields: ['core.parameters.deltaV'],
+    set: { 'core.parameters.deltaV': 14.0 },
+  }));
+  // Stale whole-object resubmission based on rev 1: its real leaf change is
+  // deltaV -> 99 (window/mode carried unchanged). Must conflict, not merge.
+  const clash = store.submitEdit(pkg.id, edit({
+    requestId: 'whole-overlap',
+    baseRevision: 1,
+    knownFields: ['core.parameters'],
+    set: { 'core.parameters': { deltaV: 99, window: W0, mode: 'SAFE' } },
+  }));
+  assert.equal(clash.adjudication.result, 'rejected');
+  assert.equal(clash.adjudication.reason, 'conflicting-paths');
+  assert.equal(store.get(pkg.id).revision, 2);
+  assert.equal(store.get(pkg.id).core.parameters.deltaV, 14.0);
+});
+
+test('merging a stale parent-object edit never clobbers committed siblings', () => {
+  const { store, pkg } = multiParamStore();
+  // B commits the new window first.
+  store.submitEdit(pkg.id, editB({ requestId: 'term-B' }));
+  // A's stale whole-object payload still contains the OLD window; merging it
+  // must keep B's window and only land A's deltaV.
+  const merged = store.submitEdit(pkg.id, editA({ requestId: 'term-A' }));
+  assert.equal(merged.adjudication.result, 'merged');
+  const p = store.get(pkg.id);
+  assert.equal(p.core.parameters.deltaV, 14.0);
+  assert.equal(p.core.parameters.window, W1);
+  assert.deepEqual(merged.adjudication.changedPaths, ['core.parameters.deltaV']);
+});
+
+test('restart replays merged requests at their first revision and keeps extensions', () => {
+  const { dir, store, pkg, raw } = multiParamStore();
+  const a = store.submitEdit(pkg.id, editA());
+  const b = store.submitEdit(pkg.id, editB());
+  assert.equal(b.adjudication.revision, 3);
+
+  const reopened = new Store(dir);
+  const replayB = reopened.submitEdit(pkg.id, editB());
+  assert.equal(replayB.adjudication.replayed, true);
+  assert.equal(replayB.adjudication.revision, 3);
+  assert.equal(replayB.adjudication.digest, b.adjudication.digest);
+  const replayA = reopened.submitEdit(pkg.id, editA());
+  assert.equal(replayA.adjudication.replayed, true);
+  assert.equal(replayA.adjudication.revision, a.adjudication.revision);
+
+  const loaded = reopened.get(pkg.id);
+  assert.equal(loaded.revision, 3);
+  assert.equal(loaded.extensionsRaw, raw);
+  assert.equal(loaded.core.parameters.deltaV, 14.0);
+  assert.equal(loaded.core.parameters.window, W1);
+  // A disjoint stale edit based on rev 1 must still merge after restart.
+  const later = reopened.submitEdit(pkg.id, edit({
+    requestId: 'post-restart-mode',
+    baseRevision: 1,
+    knownFields: ['core.parameters.mode'],
+    set: { 'core.parameters.mode': 'MANUAL' },
+  }));
+  assert.equal(later.adjudication.result, 'merged');
+  assert.equal(later.adjudication.revision, 4);
+  assert.equal(reopened.get(pkg.id).core.parameters.window, W1);
+});
+
 test('deleting an unknown field is rejected and rewrites nothing', () => {
   const { store, pkg } = makeStore();
   const out = store.submitEdit(pkg.id, edit({
