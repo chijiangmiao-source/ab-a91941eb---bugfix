@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>星载指令包审查台</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #10151c; color: #dfe7ef; }
+  header { padding: 14px 22px; background: #1a2330; border-bottom: 1px solid #2c3a4d; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 22px; }
+  section { background: #161e29; border: 1px solid #2c3a4d; border-radius: 8px; padding: 14px 16px; }
+  section h2 { margin: 0 0 10px; font-size: 15px; color: #8fb8e8; }
+  label { display: block; font-size: 12px; margin: 8px 0 3px; color: #9fb0c3; }
+  textarea, input, select { width: 100%; box-sizing: border-box; background: #0d1219; color: #dfe7ef;
+    border: 1px solid #33445a; border-radius: 5px; padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 12px; }
+  textarea { min-height: 90px; resize: vertical; }
+  button { margin-top: 10px; background: #2f6fd0; color: #fff; border: 0; border-radius: 5px;
+    padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  button.ghost { background: #2a3748; }
+  button:hover { filter: brightness(1.15); }
+  pre { background: #0d1219; border: 1px solid #263446; border-radius: 5px; padding: 8px;
+    overflow: auto; font-size: 12px; max-height: 260px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #263446; vertical-align: top; }
+  th { color: #9fb0c3; font-weight: 600; }
+  .ok { color: #6fd38a; } .bad { color: #f07f7f; } .warn { color: #e8c46f; }
+  .row { display: flex; gap: 8px; } .row > div { flex: 1; }
+  #status { font-size: 12px; color: #9fb0c3; margin-left: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>星载指令包审查台 <span id="status"></span></h1>
+</header>
+<main>
+  <section>
+    <h2>① 创建指令包（核心字段 + 扩展字段）</h2>
+    <label>核心字段 core（JSON，可编辑）</label>
+    <textarea id="createCore">{
+  "command": "ORBIT_RAISE",
+  "target": "SAT-01",
+  "parameters": { "deltaV": 12.5, "window": "2026-10-08T02:00:00Z" }
+}</textarea>
+    <label>扩展字段 extensions（JSON，旧终端不可见，逐字节保留）</label>
+    <textarea id="createExt">{
+  "x-firmware-2.0": { "attitudeTrim": [0.1, -0.2, 0.05] },
+  "signatures": ["gs:7f3a", "qc:91bc"]
+}</textarea>
+    <button onclick="createPackage()">创建指令包</button>
+    <pre id="createOut">—</pre>
+  </section>
+
+  <section>
+    <h2>② 终端提交局部修改（声明已知字段集合）</h2>
+    <div class="row">
+      <div><label>指令包</label><select id="editPkg"></select></div>
+      <div><label>基于修订 baseRevision</label><input id="editBase" type="number" min="1" value="1"></div>
+    </div>
+    <div class="row">
+      <div><label>请求标识 requestId</label><input id="editReqId"></div>
+      <div><label>&nbsp;</label><button class="ghost" onclick="genReqId()">生成 requestId</button></div>
+    </div>
+    <label>终端声明的已知字段 knownFields（每行一个规范路径）</label>
+    <textarea id="editKnown" style="min-height:50px">core.command
+core.parameters.deltaV</textarea>
+    <label>changes.set（JSON：路径 → 新值）</label>
+    <textarea id="editSet" style="min-height:50px">{ "core.command": "ORBIT_LOWER" }</textarea>
+    <label>changes.unset（JSON：待删除路径数组）</label>
+    <textarea id="editUnset" style="min-height:36px">[]</textarea>
+    <button onclick="submitEdit()">提交局部修改</button>
+    <pre id="editOut">—</pre>
+  </section>
+
+  <section>
+    <h2>③ 当前状态：修订 / 规范摘要 / 被保留的扩展字段</h2>
+    <div class="row">
+      <div><label>指令包</label><select id="viewPkg"></select></div>
+      <div><label>&nbsp;</label><button class="ghost" onclick="refreshView()">刷新</button></div>
+    </div>
+    <div id="viewMeta"></div>
+    <label>核心字段（当前）</label><pre id="viewCore">—</pre>
+    <label>扩展字段（响应中的原始字节，未经重序列化）</label><pre id="viewExt">—</pre>
+    <label>规范摘要 canonical</label><pre id="viewCanonical">—</pre>
+  </section>
+
+  <section>
+    <h2>④ 裁决记录</h2>
+    <table>
+      <thead><tr><th>时间</th><th>requestId</th><th>结果</th><th>修订</th><th>实际改动路径 / 原因</th></tr></thead>
+      <tbody id="adjBody"><tr><td colspan="5">—</td></tr></tbody>
+    </table>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'content-type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { /* extensions spliced raw — still valid JSON */ }
+  return { status: res.status, text, data };
+}
+
+function show(id, obj) {
+  $(id).textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+}
+
+async function refreshPackages() {
+  const { data } = await api('GET', '/api/packages');
+  const opts = (data.packages || []).map(p =>
+    `<option value="${p.id}">${p.id} (rev ${p.revision})</option>`).join('');
+  for (const sel of ['editPkg', 'viewPkg']) {
+    const prev = $(sel).value;
+    $(sel).innerHTML = opts || '<option value="">（无）</option>';
+    if (prev) $(sel).value = prev;
+  }
+  $('status').textContent = `健康检查中…`;
+  const h = await api('GET', '/healthz');
+  $('status').textContent = h.data && h.data.status === 'ok'
+    ? `服务正常 · 运行 ${h.data.uptimeSeconds}s` : '服务异常';
+}
+
+async function createPackage() {
+  let core, extensions;
+  try { core = JSON.parse($('createCore').value); } catch (e) { return show('createOut', 'core JSON 解析失败: ' + e.message); }
+  try { extensions = JSON.parse($('createExt').value); } catch (e) { return show('createOut', 'extensions JSON 解析失败: ' + e.message); }
+  const r = await api('POST', '/api/packages', { core, extensions });
+  show('createOut', `HTTP ${r.status}\n` + r.text);
+  await refreshPackages();
+  if (r.data && r.data.id) { $('editPkg').value = r.data.id; $('viewPkg').value = r.data.id; refreshView(); }
+}
+
+function genReqId() { $('editReqId').value = crypto.randomUUID(); }
+
+async function submitEdit() {
+  const id = $('editPkg').value;
+  if (!id) return show('editOut', '请先选择指令包');
+  let set, unset;
+  try { set = JSON.parse($('editSet').value || '{}'); } catch (e) { return show('editOut', 'set JSON 解析失败: ' + e.message); }
+  try { unset = JSON.parse($('editUnset').value || '[]'); } catch (e) { return show('editOut', 'unset JSON 解析失败: ' + e.message); }
+  const body = {
+    requestId: $('editReqId').value || crypto.randomUUID(),
+    baseRevision: Number($('editBase').value),
+    knownFields: $('editKnown').value.split('\n').map(s => s.trim()).filter(Boolean),
+    changes: { set, unset },
+  };
+  const r = await api('POST', `/api/packages/${id}/edits`, body);
+  show('editOut', `HTTP ${r.status}\n` + r.text);
+  refreshView();
+}
+
+// Extract the raw "extensions" substring from the response text to prove the
+// bytes are served verbatim, then parse the whole document for the rest.
+function extractRaw(text, key) {
+  const m = text.match(new RegExp('"' + key + '"\\s*:'));
+  if (!m) return null;
+  let i = m.index + m[0].length;
+  while (' \t\r\n'.includes(text[i])) i++;
+  const start = i;
+  let depth = 0;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') { i++; while (text[i] !== '"') { if (text[i] === '\\') i++; i++; } }
+    else if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') { if (depth === 0) break; depth--; }
+    else if (c === ',' && depth === 0) break;
+  }
+  return text.slice(start, i);
+}
+
+async function refreshView() {
+  const id = $('viewPkg').value;
+  if (!id) return;
+  const r = await api('GET', `/api/packages/${id}`);
+  if (!r.data) return show('viewCore', `HTTP ${r.status}: ${r.text}`);
+  const d = r.data;
+  $('viewMeta').innerHTML =
+    `<p>当前修订：<b class="ok">rev ${d.revision}</b> · 摘要算法：${d.summary.algorithm}<br>` +
+    `摘要指纹：<code>${d.summary.digest}</code></p>`;
+  show('viewCore', d.core);
+  $('viewExt').textContent = extractRaw(r.text, 'extensions') || '(无)';
+  show('viewCanonical', d.summary.canonical);
+  const rows = d.adjudications.map(a => {
+    const cls = a.result === 'rejected' ? 'bad' : (a.result === 'merged' ? 'warn' : 'ok');
+    const detail = a.result === 'rejected' ? (a.reason + (a.detail ? ' — ' + a.detail : ''))
+      : (a.changedPaths || []).join(', ');
+    return `<tr><td>${a.at}</td><td>${a.requestId.slice(0, 8)}…</td>` +
+      `<td class="${cls}">${a.result}</td><td>${a.revision}</td><td>${detail}</td></tr>`;
+  }).join('');
+  $('adjBody').innerHTML = rows || '<tr><td colspan="5">（暂无裁决）</td></tr>';
+  $('editBase').value = d.revision;
+}
+
+$('viewPkg').addEventListener('change', refreshView);
+genReqId();
+refreshPackages();
+setInterval(refreshPackages, 15000);
+</script>
+</body>
+</html>
