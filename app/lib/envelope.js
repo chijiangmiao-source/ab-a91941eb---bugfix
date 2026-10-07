@@ -77,6 +77,71 @@ function unsetAt(obj, path) {
   return root;
 }
 
+/** Whether a canonical path exists on the object (null counts, undefined does not). */
+function hasPath(obj, path) {
+  let node = obj;
+  for (const seg of path.split('.')) {
+    if (node === null || typeof node !== 'object') return false;
+    if (!Object.prototype.hasOwnProperty.call(node, seg)) return false;
+    node = node[seg];
+  }
+  return true;
+}
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/**
+ * Leaf paths carried by a value rooted at `prefix`. Plain objects recurse;
+ * arrays and primitives are treated as opaque leaves (canonical field paths
+ * never index into arrays).
+ */
+function leafPaths(value, prefix) {
+  const join = (p, k) => (p ? p + '.' + k : k);
+  if (!isPlainObject(value)) return [prefix];
+  const out = [];
+  for (const k of Object.keys(value).sort()) {
+    out.push(...leafPaths(value[k], join(prefix, k)));
+  }
+  return out;
+}
+
+/**
+ * Sorted de-duplicated leaf paths at which two values differ (changed, added or
+ * removed). A terminal that resubmits a whole parent object therefore only
+ * "changes" the leaves that actually differ from its base — unchanged siblings
+ * never participate in conflict checks or overwrite concurrent commits.
+ * Accepts document wrappers called as diffLeaves({core:a}, {core:b}, '').
+ */
+function diffLeaves(before, after, prefix = '') {
+  const join = (p, k) => (p ? p + '.' + k : k);
+  const changed = [];
+  const walk = (a, b, p) => {
+    const aObj = isPlainObject(a);
+    const bObj = isPlainObject(b);
+    if (aObj && bObj) {
+      for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+        const hasA = Object.prototype.hasOwnProperty.call(a, k);
+        const hasB = Object.prototype.hasOwnProperty.call(b, k);
+        if (hasA && hasB) {
+          walk(a[k], b[k], join(p, k));
+        } else if (hasB) {
+          changed.push(...leafPaths(b[k], join(p, k)));
+        } else {
+          changed.push(...leafPaths(a[k], join(p, k)));
+        }
+      }
+    } else if (canonicalize(a) !== canonicalize(b)) {
+      // Different leaves, or an object<->leaf type change: enumerate every
+      // leaf path on both sides; the final Set de-duplicates identical ones.
+      changed.push(...leafPaths(a, p), ...leafPaths(b, p));
+    }
+  };
+  walk(before, after, prefix);
+  return [...new Set(changed)].sort();
+}
+
 /**
  * Locate the raw JSON text of a top-level property value inside a JSON object
  * body. Returns null when the key is absent at depth 1. This is how the
@@ -148,10 +213,6 @@ function extractRawValue(bodyText, key) {
 function summarize(core, extensionsRaw) {
   const canonical = canonicalize({ core, extensions: JSON.parse(extensionsRaw) });
   return { algorithm: 'sha256', digest: sha256(canonical), canonical };
-}
-
-function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -231,6 +292,9 @@ module.exports = {
   getAt,
   setAt,
   unsetAt,
+  hasPath,
+  leafPaths,
+  diffLeaves,
   extractRawValue,
   summarize,
   validateCreate,

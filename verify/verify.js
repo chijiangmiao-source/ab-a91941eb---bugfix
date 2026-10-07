@@ -6,8 +6,9 @@
 //   3. HTTP smoke               (health, field preservation, conflict handling)
 // The process exit code is the acceptance result: 0 = accepted, 1 = rejected.
 
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
@@ -116,6 +117,237 @@ async function api(method, url, body) {
   return { status: res.status, text, data };
 }
 
+/* ---- Leaf-aware merge scenarios (the stale-edit conflict repair) ---- */
+
+const SCEN_EXT_RAW = '{ "x-firmware-2.0": { "attitudeTrim": [0.1, -0.2, 0.05], "mode": "SEMI" },\n'
+  + '  "signatures": ["gs:7f3a", "qc:91bc"], "x-window-policy": { "earliest": "2026-10-08T00:00:00Z" } }';
+
+const SCEN_CORE = () => JSON.parse(JSON.stringify({
+  command: 'ORBIT_RAISE',
+  target: 'SAT-01',
+  parameters: { deltaV: 12.5, window: '2026-10-08T02:00:00Z', mode: 'SAFE' },
+}));
+
+// Terminal A: knows the whole parameters object but only changes deltaV.
+function editA(rid, baseRevision, deltaV) {
+  return {
+    requestId: rid,
+    baseRevision,
+    knownFields: ['core.parameters'],
+    changes: { set: { 'core.parameters': {
+      deltaV, window: '2026-10-08T02:00:00Z', mode: 'SAFE',
+    } }, unset: [] },
+  };
+}
+// Terminal B: only knows the execution window.
+function editB(rid, baseRevision, window) {
+  return {
+    requestId: rid,
+    baseRevision,
+    knownFields: ['core.parameters.window'],
+    changes: { set: { 'core.parameters.window': window }, unset: [] },
+  };
+}
+
+async function createScenarioPackage() {
+  const res = await fetch(APP_URL + '/api/packages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: `{"core":${JSON.stringify(SCEN_CORE())},"extensions":${SCEN_EXT_RAW}}`,
+  });
+  const text = await res.text();
+  return { status: res.status, data: JSON.parse(text), text };
+}
+
+async function stageLeafMergeScenarios(api, check) {
+  // The web page itself must be served.
+  const page = await api('GET', '/');
+  check('review page is served', page.status === 200 && /<!DOCTYPE html>/i.test(page.text));
+
+  // --- Commit order 1: parent-object terminal A first, leaf terminal B second.
+  const p1 = await createScenarioPackage();
+  check('scenario package created with multi-parameter core + extensions',
+    p1.status === 201 && p1.data.revision === 1, 'id=' + p1.data.id);
+  const a1 = await api('POST', `/api/packages/${p1.data.id}/edits`, editA('lm-a1', 1, 15.0));
+  check('order-1: terminal A (whole object, only deltaV changed) applied',
+    a1.status === 200 && a1.data.adjudication.result === 'applied'
+      && JSON.stringify(a1.data.adjudication.changedPaths) === JSON.stringify(['core.parameters.deltaV']),
+    JSON.stringify(a1.data && a1.data.adjudication));
+  const b1 = await api('POST', `/api/packages/${p1.data.id}/edits`,
+    editB('lm-b1', 1, '2026-10-09T04:30:00Z'));
+  check('order-1: stale terminal B (window only) is merged, not path-conflicted',
+    b1.status === 200 && b1.data.adjudication.result === 'merged'
+      && b1.data.adjudication.revision === 3,
+    `${b1.status} ${JSON.stringify(b1.data && b1.data.adjudication)}`);
+  const s1 = await api('GET', `/api/packages/${p1.data.id}`);
+  check('order-1: merged core keeps A deltaV and B window, mode untouched',
+    s1.data.revision === 3
+      && s1.data.core.parameters.deltaV === 15.0
+      && s1.data.core.parameters.window === '2026-10-09T04:30:00Z'
+      && s1.data.core.parameters.mode === 'SAFE');
+  check('order-1: canonical summary recomputed (64-hex digest)',
+    /^[0-9a-f]{64}$/.test(s1.data.summary.digest));
+  check('order-1: extension raw bytes still byte-for-byte',
+    extractRaw(s1.text, 'extensions') === SCEN_EXT_RAW);
+  const results1 = s1.data.adjudications.map((x) => x.result);
+  check('order-1: adjudication records applied then merged',
+    results1.includes('applied') && results1.includes('merged') && !results1.includes('rejected'),
+    results1.join(','));
+
+  // --- Commit order 2: leaf terminal B first, parent-object terminal A second.
+  const p2 = await createScenarioPackage();
+  const b2 = await api('POST', `/api/packages/${p2.data.id}/edits`,
+    editB('lm-b2', 1, '2026-10-09T04:30:00Z'));
+  check('order-2: terminal B (window) applied', b2.status === 200);
+  const a2 = await api('POST', `/api/packages/${p2.data.id}/edits`, editA('lm-a2', 1, 15.0));
+  check('order-2: stale parent-object submission is merged without clobbering B window',
+    a2.status === 200 && a2.data.adjudication.result === 'merged'
+      && a2.data.adjudication.revision === 3,
+    `${a2.status} ${JSON.stringify(a2.data && a2.data.adjudication)}`);
+  const s2 = await api('GET', `/api/packages/${p2.data.id}`);
+  check('order-2: core has both new deltaV and B committed window',
+    s2.data.core.parameters.deltaV === 15.0
+      && s2.data.core.parameters.window === '2026-10-09T04:30:00Z'
+      && s2.data.core.parameters.mode === 'SAFE');
+
+  // --- Same leaf changed to different values by two stale terminals: rejected.
+  const p3 = await createScenarioPackage();
+  await api('POST', `/api/packages/${p3.data.id}/edits`, editB('lm-c1', 1, '2026-10-09T04:30:00Z'));
+  const c2 = await api('POST', `/api/packages/${p3.data.id}/edits`, editB('lm-c2', 1, '2026-10-10T00:00:00Z'));
+  check('same leaf, different values: rejected as conflicting-paths',
+    c2.status === 409 && c2.data.adjudication.reason === 'conflicting-paths'
+      && c2.data.adjudication.changedPaths.includes('core.parameters.window'));
+  const s3 = await api('GET', `/api/packages/${p3.data.id}`);
+  check('same-leaf conflict advances no revision and keeps first value',
+    s3.data.revision === 2 && s3.data.core.parameters.window === '2026-10-09T04:30:00Z');
+
+  // --- Whole-object submission that really overlaps on a leaf: rejected.
+  const p4 = await createScenarioPackage();
+  await api('POST', `/api/packages/${p4.data.id}/edits`, editA('lm-d1', 1, 15.0));
+  const d2 = await api('POST', `/api/packages/${p4.data.id}/edits`, editA('lm-d2', 1, 20.0));
+  check('whole-object submit that really changes the same leaf is not merged',
+    d2.status === 409 && d2.data.adjudication.reason === 'conflicting-paths'
+      && d2.data.adjudication.changedPaths.includes('core.parameters.deltaV'),
+    `${d2.status} ${JSON.stringify(d2.data && d2.data.adjudication)}`);
+  const s4 = await api('GET', `/api/packages/${p4.data.id}`);
+  check('whole-object conflict keeps revision 2 and first terminal value',
+    s4.data.revision === 2 && s4.data.core.parameters.deltaV === 15.0
+      && s4.data.core.parameters.window === '2026-10-08T02:00:00Z');
+}
+
+/* ---- Restart replay on an isolated data volume ---- */
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const net = require('node:net');
+    const srv = net.createServer();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+function startServer(dir, port) {
+  return spawn(process.execPath, [path.join(ROOT, 'app/server.js')], {
+    cwd: ROOT,
+    env: { ...process.env, PORT: String(port), DATA_DIR: dir },
+    stdio: 'ignore',
+  });
+}
+
+async function stopServer(child) {
+  if (!child || child.killed) return;
+  child.kill('SIGTERM');
+  try { await require('node:events').once(child, 'exit'); } catch { /* already gone */ }
+}
+
+async function waitFor(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url + '/healthz');
+      if (res.ok) return true;
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+async function stageRestartReplay(check) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'satcmd-verify-'));
+  const port = await freePort();
+  const base = `http://127.0.0.1:${port}`;
+
+  let child = startServer(dir, port);
+  let up = await waitFor(base, 30000);
+  check('restart: isolated server starts healthy', up, base);
+  if (!up) { await stopServer(child); return; }
+
+  const created = await fetch(base + '/api/packages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: `{"core":${JSON.stringify(SCEN_CORE())},"extensions":${SCEN_EXT_RAW}}`,
+  }).then((r) => r.json());
+  const id = created.id;
+  const firstA = await fetch(base + `/api/packages/${id}/edits`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(editA('rr-a', 1, 15.0)),
+  }).then((r) => r.json());
+  const firstB = await fetch(base + `/api/packages/${id}/edits`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(editB('rr-b', 1, '2026-10-09T04:30:00Z')),
+  }).then((r) => r.json());
+  check('restart: both edits accepted before restart (applied + merged, rev 3)',
+    firstA.adjudication.result === 'applied' && firstB.adjudication.result === 'merged'
+      && firstB.adjudication.revision === 3,
+    JSON.stringify(firstB.adjudication));
+
+  // Restart the service against the same isolated data volume.
+  await stopServer(child);
+  child = startServer(dir, port);
+  up = await waitFor(base, 30000);
+  check('restart: service is healthy again on the same volume', up);
+
+  const after = await fetch(base + `/api/packages/${id}`).then(async (r) => ({
+    status: r.status, text: await r.text(), data: null,
+  }));
+  after.data = JSON.parse(after.text);
+  check('restart: current revision and both terminal values survive',
+    after.data.revision === 3
+      && after.data.core.parameters.deltaV === 15.0
+      && after.data.core.parameters.window === '2026-10-09T04:30:00Z'
+      && after.data.core.parameters.mode === 'SAFE');
+  check('restart: new terminal reads complete extension content',
+    after.data.extensions && after.data.extensions['x-window-policy']
+      && after.data.extensions['x-window-policy'].earliest === '2026-10-08T00:00:00Z');
+  check('restart: extension raw bytes survive verbatim',
+    extractRaw(after.text, 'extensions') === SCEN_EXT_RAW);
+
+  // Stable request ids replay their first adjudication (revision + summary).
+  const replayA = await fetch(base + `/api/packages/${id}/edits`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(editA('rr-a', 1, 15.0)),
+  }).then((r) => r.json());
+  check('restart: request A replays its first revision 2 and digest',
+    replayA.adjudication.replayed === true
+      && replayA.adjudication.revision === firstA.adjudication.revision
+      && replayA.adjudication.digest === firstA.adjudication.digest
+      && replayA.adjudication.result === 'applied');
+  const replayB = await fetch(base + `/api/packages/${id}/edits`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(editB('rr-b', 1, '2026-10-09T04:30:00Z')),
+  }).then((r) => r.json());
+  check('restart: request B replays its first revision 3, merged verdict and digest',
+    replayB.adjudication.replayed === true
+      && replayB.adjudication.revision === 3
+      && replayB.adjudication.result === 'merged'
+      && replayB.adjudication.digest === firstB.adjudication.digest);
+  const finalState = await fetch(base + `/api/packages/${id}`).then((r) => r.json());
+  check('restart: replays do not advance the revision', finalState.revision === 3);
+
+  await stopServer(child);
+}
+
 async function stageHttpSmoke() {
   let ok = true;
   const check = (name, cond, detail) => { record('smoke', name, !!cond, detail); ok = ok && !!cond; };
@@ -214,6 +446,12 @@ async function stageHttpSmoke() {
   const full = await api('GET', `/api/packages/${cid}`);
   check('new terminal reads complete extension content',
     full.data.extensions && full.data.extensions['x-band-plan'].slot === 4);
+
+  // --- Leaf-aware stale-merge repair (both orders, conflicts, overlaps) ------
+  await stageLeafMergeScenarios(api, check);
+
+  // --- Restart replay on an isolated data volume -----------------------------
+  await stageRestartReplay(check);
 
   return ok;
 }

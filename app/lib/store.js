@@ -13,6 +13,10 @@ const crypto = require('node:crypto');
 const { summarize } = require('./envelope');
 const { adjudicateEdit } = require('./adjudicate');
 
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 class Store {
   constructor(dir) {
     this.dir = dir;
@@ -21,6 +25,10 @@ class Store {
     for (const file of fs.readdirSync(dir)) {
       if (!file.endsWith('.json')) continue;
       const pkg = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+      // Documents written before leaf snapshots existed: seed the rev-1
+      // snapshot from the earliest state still recoverable is impossible, so
+      // the adjudication engine uses its conservative legacy path for them.
+      if (pkg.createdCore === undefined) pkg.createdCore = null;
       this.packages.set(pkg.id, pkg);
     }
   }
@@ -48,6 +56,8 @@ class Store {
       id: pkgId,
       revision: 1,
       core,
+      // Immutable snapshot of revision 1: the merge base for stale edits.
+      createdCore: clone(core),
       extensionsRaw,
       history: [],
       adjudications: [],
@@ -71,6 +81,8 @@ class Store {
         revision: commit.revision,
         requestId: edit.requestId,
         changedPaths: commit.changedPaths,
+        // Post-commit snapshot, making the next stale edit three-way mergeable.
+        coreAfter: clone(commit.core),
       });
     }
     if (!adjudication.replayed) {
